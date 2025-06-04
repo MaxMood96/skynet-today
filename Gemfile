@@ -11,11 +11,11 @@ ruby RUBY_VERSION
 # If you have any plugins, put them here!
 gem 'wdm', '>= 0.1.0' if Gem.win_platform?
 group :jekyll_plugins do
-    gem 'jekyll-feed'
-    gem 'jekyll-sitemap'
+    gem 'jekyll-feed', '>= 0.13.0'
+    gem 'jekyll-sitemap', '>= 1.4.0'
     gem 'jekyll-paginate'
-    gem 'jekyll-seo-tag'
-    gem 'jekyll-last-modified-at'
+    gem 'jekyll-seo-tag', '>= 2.7.0'
+    gem 'jekyll-last-modified-at', '>= 1.2.0'
     gem 'jekyll-gist'
-    gem 'jekyll-redirect-from'
+    gem 'jekyll-redirect-from', '>= 0.16.0'
 end
