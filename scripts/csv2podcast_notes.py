@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 import argparse
 import requests
 
@@ -11,15 +12,10 @@ from pathlib import Path
 from datetime import date, timedelta
 from tqdm.auto import tqdm
 
-from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
-import anthropic
-with open('secrets/anthropic_api_key.txt', 'r') as f:
-    _ANTHROPIC_CLIENT = anthropic.Anthropic(api_key=f.read().strip())
+from llm_utils import query_llm, web_fetch_summarize, MODEL_SONNET
 from content_retrieval import get_arxiv_paper_contents, get_arxiv_pdf_bytes, get_reuters_article_content
 
 # Constants
-DEFAULT_MAX_TOKENS = 4000
-DEFAULT_MODEL = 'claude-sonnet-4-6'
 IMAGE_FOLDER = 'images'
 OUTPUT_FILE = 'summaries.md'
 INPUT_CSV = 'news.csv'
@@ -44,76 +40,6 @@ SECTION_CATEGORY_MAPPINGS = {
     "Fun!": 'Fun!'}
 STORY_TYPE_COL = "Main Story or Lighting Round?"
 STORY_SECTION_COL = "Section"
-
-@retry(wait=wait_random_exponential(min=10, max=120), stop=stop_after_attempt(10), retry=retry_if_exception_type(anthropic.RateLimitError))
-def query_llm(messages, max_tokens=DEFAULT_MAX_TOKENS, model=DEFAULT_MODEL):
-    """Query Anthropic API with retry logic."""
-    # Extract system prompt from messages
-    system = None
-    api_messages = []
-    for msg in messages:
-        if msg['role'] == 'system':
-            system = msg['content']
-        else:
-            api_messages.append(msg)
-
-    kwargs = dict(
-        model=model,
-        messages=api_messages,
-        max_tokens=max_tokens,
-        thinking={"type": "adaptive"},
-        output_config={"effort": "low"},
-    )
-    if system:
-        kwargs['system'] = system
-
-    response = _ANTHROPIC_CLIENT.messages.create(**kwargs)
-    return next(b.text for b in response.content if b.type == "text")
-
-@retry(wait=wait_random_exponential(min=10, max=120), stop=stop_after_attempt(10), retry=retry_if_exception_type(anthropic.RateLimitError))
-def summarize_with_web_fetch(url, system_prompt):
-    """Fallback: use Claude's server-side web_fetch tool to read the article."""
-    print('  newspaper download failed, falling back to web_fetch tool...')
-    tools = [
-        {"type": "web_fetch_20260209", "name": "web_fetch"},
-        {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
-    ]
-    user_prompt = f"Fetch this article and summarize it: {url}\n\nBe efficient — you only have a few turns. If the URL is blocked or inaccessible, search for and fetch other sources covering the same story instead. In your final message, output ONLY the bullet point summary in markdown, nothing else."
-    messages = [{
-        "role": "user",
-        "content": user_prompt,
-    }]
-    # Loop to handle pause_turn (server-side tool may need multiple rounds)
-    for turn in range(10):
-        print(f'  web_fetch turn {turn + 1}, stop_reason: ...', end='')
-        response = _ANTHROPIC_CLIENT.messages.create(
-            model=DEFAULT_MODEL,
-            max_tokens=DEFAULT_MAX_TOKENS,
-            system=system_prompt,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "low"},
-            tools=tools,
-            messages=messages,
-        )
-        print(f'\r  web_fetch turn {turn + 1}, stop_reason: {response.stop_reason}, usage: {response.usage}')
-        for block in response.content:
-            if block.type == "text":
-                print(f'  [text] {block.text[:200]}')
-            elif block.type == "server_tool_use":
-                print(f'  [tool_use] {block.name}({block.input})')
-            elif block.type == "web_search_tool_result":
-                print(f'  [web_fetch_result]')
-        if response.stop_reason == "end_turn":
-            break
-        # Continue: pass response back for the next round
-        messages = [
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": response.content},
-        ]
-    # Get the last text block (earlier ones may be preamble like "Let me fetch that")
-    text_blocks = [b.text for b in response.content if b.type == "text"]
-    return text_blocks[-1] if text_blocks else "Error: no text in response"
-
 
 def summarize_article(url, lighting_round_story=False, save_image=False):
     """Generate a bullet point summary of a news article or research paper."""
@@ -158,11 +84,10 @@ Your task is to provide a bullet point summary of a news article or research pap
     system_prompt = system_prompt.strip()
 
     if download_failed:
-        return summarize_with_web_fetch(url, system_prompt)
+        return web_fetch_summarize(url, system_prompt)
 
     if pdf_bytes is not None:
         # Send the PDF directly to Claude
-        import base64
         user_content = [
             {
                 "type": "document",

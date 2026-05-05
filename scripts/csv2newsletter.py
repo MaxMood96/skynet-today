@@ -8,16 +8,12 @@ import pandas as pd
 import inflect
 import json
 
-from openai import OpenAI
-with open('secrets/openai_api_key.txt', 'r') as f:
-    _OPENAI_CLIENT = OpenAI(api_key=f.read().strip())
-
 from newspaper import Article
 from pathlib import Path
 from datetime import date, timedelta
 from tqdm.auto import tqdm
 
-from tenacity import retry, stop_after_attempt, wait_random_exponential
+from llm_utils import query_llm_simple, web_fetch_article_text, MODEL_SONNET, MODEL_HAIKU
 from content_retrieval import get_arxiv_paper_contents
 
 # Constants for text limits
@@ -66,32 +62,6 @@ def apply_map_batch(func, args_list):
     return results
 
 
-@retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(10))
-def query_openai(instructions, user_input, max_completion_tokens=100, model='gpt-5', debug_label=""):
-    try:
-        if instructions:
-            result = _OPENAI_CLIENT.responses.create(
-                model=model,
-                instructions=instructions,
-                input=user_input,
-                reasoning={"effort": "minimal"},
-            ).output_text
-        else:
-            result = _OPENAI_CLIENT.responses.create(
-                model=model,
-                input=user_input
-            ).output_text
-
-        return result
-    except Exception as e:
-        print(f"ERROR in query_openai ({debug_label}): {type(e).__name__}: {e}")
-        if hasattr(e, 'response'):
-            print(f"Response: {e.response}")
-        if hasattr(e, 'body'):
-            print(f"Body: {e.body}")
-        raise
-
-
 def get_article_category(row, article_text):
     type_val = row.get('Type') if hasattr(row, 'get') else None
     if type_val and isinstance(type_val, str):
@@ -107,7 +77,7 @@ def get_article_category(row, article_text):
 
     # Use first N characters of article text if available, otherwise just title and URL
     text_preview = article_text[:CATEGORY_TEXT_PREVIEW_LENGTH] if article_text else "No text available"
-    
+
     prompt = f'''
 Title: {title}
 Text Preview: {text_preview}
@@ -126,34 +96,34 @@ Expert Opinions: Opinion pieces from experts and not factual reporting. If it's 
 Explainers: Explains a given topic in AI with the goal to educate the reader; tutorials, guides.
 Fun: Anything silly, fun, and doesn't belong to the other types.
 
-The user will provide the article title, link, and text preview. 
+The user will provide the article title, link, and text preview.
 After careful consideration, you will respond with ONLY the predicted article type, with no explanations, punctuation, formatting, or anything else.
 Only respond with one of the above types (Business, Research, Tools, Concerns, Policy, Analysis, Expert Opinions, Explainers, Fun).
 '''.strip()
-    return query_openai(
+    return query_llm_simple(
         system_prompt,
         prompt,
-        model="gpt-5-mini-2025-08-07",
-        max_completion_tokens=EXCERPT_MAX_TOKENS,
+        model=MODEL_HAIKU,
+        max_tokens=EXCERPT_MAX_TOKENS,
         debug_label=f"CATEGORY for {title[:30]}"
     )
 
 
 def get_news_article(url):
-    try:
-        if 'arxiv' in url:
-            text = get_arxiv_paper_contents(url)
+    if 'arxiv' in url:
+        text = get_arxiv_paper_contents(url)
+        if text:
             return {
                 'text': text,
                 'top_image': None,
                 'has_top_image': False
             }
-        else:
-            article = Article(url)
-            article.download()
-            article.parse()
-            if not article.text:
-                return None
+
+    try:
+        article = Article(url)
+        article.download()
+        article.parse()
+        if article.text:
             return {
                 'title': article.title,
                 'text': article.text,
@@ -161,7 +131,21 @@ def get_news_article(url):
                 'has_top_image': article.has_top_image()
             }
     except Exception as e:
-        return None
+        print(f'  newspaper download error for {url}: {e}')
+
+    # Fallback: use web_fetch to get article text
+    try:
+        text = web_fetch_article_text(url)
+        if text:
+            return {
+                'text': text,
+                'top_image': None,
+                'has_top_image': False
+            }
+    except Exception as e:
+        print(f'  web_fetch fallback also failed for {url}: {e}')
+
+    return None
 
 
 def clip_text_words(text, max_words=MAX_ARTICLE_WORDS):
@@ -191,16 +175,16 @@ Examples:
 * 'Google is testing a vibe-coding app called Opal' -> 'The app allows users to create and share mini web apps using text prompts and a visual workflow, aiming to make app development accessible to non-technical users.'
 * 'GitHub Goes After Vibe Coding Fans with the Public Preview of GitHub Spark' -> 'Spark allows users to create full-stack apps from natural language prompts, and is available to Copilot Pro+ subscribers for $39 a month.'
 '''.strip()
-    
+
     prompt = f'''
 Title: {row['Name']}
 Text: {clip_text_words(article["text"])}
 '''.strip()
-    return query_openai(
+    return query_llm_simple(
         system_prompt,
         prompt,
-        model="gpt-5-mini-2025-08-07",
-        max_completion_tokens=EXCERPT_MAX_TOKENS,
+        model=MODEL_HAIKU,
+        max_tokens=EXCERPT_MAX_TOKENS,
         debug_label=f"EXCERPT for {row['Name'][:30]}"
     )
 
@@ -230,68 +214,50 @@ def get_output_file_name(digest_number):
 def get_article_summary(title, news_article, related_articles=None):
     if not news_article:
         return ':/'
-    
+
     # Determine if we have multiple articles to summarize
     has_related = related_articles and len(related_articles) > 0
-    
+
     if has_related:
         system_prompt = '''
-You are an expert writer and commentator hired to write summaries of articles for the newsletter Last Week in AI. 
+You are an expert writer and commentator hired to write summaries of articles for the newsletter Last Week in AI.
 I will give you a main article and related articles with their text, and you will write a concise summary that covers all the stories.
 The summary should be at most two paragraphs long, with each paragraph having at least four sentences, contain key technical details, and be easy to understand. If it makes sense, you can also include a bullet point list.
-The summary should highlight key words and concepts from all articles without abstracting them away. 
+The summary should highlight key words and concepts from all articles without abstracting them away.
 The reader should clearly understand the key points from all the stories after reading your summary.
-Focus on the details of the concrete details of the stories rather than context or implications. 
+Focus on the details of the concrete details of the stories rather than context or implications.
 When multiple articles are provided, synthesize the information to give a comprehensive overview of the topic.
 The writing style should be succinct and direct.'''.strip()
-        
+
         # Build user prompt with main article and related articles
         user_prompt = f'Main Article:\nTitle: {title}\n{clip_text_words(news_article["text"])}\n\n'
-        
+
         user_prompt += 'Related Articles:\n'
         for i, related in enumerate(related_articles, 1):
             user_prompt += f'Related Article {i}:\nTitle: {related["title"]}\n{clip_text_words(related["text"])}\n\n'
-        
+
         user_prompt = user_prompt.strip()
     else:
         system_prompt = '''
-You are an expert writer and commentator hired to write summaries of articles for the newsletter Last Week in AI. 
+You are an expert writer and commentator hired to write summaries of articles for the newsletter Last Week in AI.
 I will give you an article with associated text, and you will write a concise summary.
 The summary should be at most two paragraphs long, with each paragraph having at least four sentences, contain key technical details, and be easy to understand. If it makes sense, you can also include a bullet point list.
-The summary should highlight key words and concepts from the article without abstracting them away. 
+The summary should highlight key words and concepts from the article without abstracting them away.
 The reader should clearly understand the key points from the article after reading your summary.
-Focus on the details of the concrete details of the story rather than context or implications. 
+Focus on the details of the concrete details of the story rather than context or implications.
 The writing style should be succinct and direct.'''.strip()
-        
+
         user_prompt = f'''
 Title: {title}
 {clip_text_words(news_article["text"])}
 '''.strip()
 
     try:
-        result = query_openai(system_prompt, user_prompt, max_completion_tokens=SUMMARY_MAX_TOKENS, model='gpt-5', debug_label=f"SUMMARY for {title[:30]}")
-        return result
+        return query_llm_simple(system_prompt, user_prompt, max_tokens=SUMMARY_MAX_TOKENS, model=MODEL_SONNET, debug_label=f"SUMMARY for {title[:30]}")
     except Exception as e:
         print(f"Error generating summary for {title}")
         print(f"Exception type: {type(e).__name__}")
         print(f"Exception message: {str(e)}")
-        
-        # For RetryError from tenacity, try to get the underlying error
-        if hasattr(e, 'last_attempt') and e.last_attempt:
-            try:
-                underlying = e.last_attempt.exception()
-                print(f"Underlying exception: {type(underlying).__name__}: {str(underlying)}")
-                # For OpenAI errors, try to get more details
-                if hasattr(underlying, 'response') and underlying.response:
-                    print(f"HTTP Status: {underlying.response.status_code}")
-                    if hasattr(underlying.response, 'text'):
-                        print(f"Response text: {underlying.response.text}")
-                if hasattr(underlying, 'body'):
-                    print(f"Error body: {underlying.body}")
-            except Exception as inner_e:
-                print(f"Could not extract underlying error: {inner_e}")
-        
-        # Re-raise to let the caller handle it
         raise
 
 
@@ -310,7 +276,7 @@ Format your response as a valid JSON list of article indices, starting with the 
         for idx, article in enumerate(articles)
     ])
 
-    output = query_openai(system_prompt, user_prompt, max_completion_tokens=RANKING_MAX_TOKENS, model='gpt-5', debug_label=f"RANKING {len(articles)} articles")
+    output = query_llm_simple(system_prompt, user_prompt, max_tokens=RANKING_MAX_TOKENS, model=MODEL_SONNET, debug_label=f"RANKING {len(articles)} articles")
     start = output.find('[')
     end = output.find(']')
     output = output[start:end+1]
@@ -329,10 +295,8 @@ OpenAI lawsuits, NASA to explore AI on spaceships, OpenAI vs. Microsoft, generat
 
 Victims of false facial regonition matches, White House launches AI-based security contest, Spotify launches AI DJ globally, bots solve captchas better than humans, and more
 '''.strip()
-    
-    user_prompt = top_news
 
-    return query_openai(system_prompt, user_prompt, max_completion_tokens=NEWSLETTER_EXCERPT_MAX_TOKENS, model='gpt-5', debug_label="NEWSLETTER_EXCERPT")
+    return query_llm_simple(system_prompt, top_news, max_tokens=NEWSLETTER_EXCERPT_MAX_TOKENS, model=MODEL_HAIKU, debug_label="NEWSLETTER_EXCERPT")
 
 
 def process_related_articles(related_articles_str):
@@ -345,8 +309,8 @@ def process_related_articles(related_articles_str):
     related_urls = [url.strip() for url in related_articles_str.split(',') if url.strip()]
 
     for related_url in related_urls:
+        clean_related_url = clean_url(related_url.strip())
         try:
-            clean_related_url = clean_url(related_url.strip())
             related_article = Article(clean_related_url)
             related_article.download()
             related_article.parse()
@@ -357,8 +321,21 @@ def process_related_articles(related_articles_str):
                     'text': related_article.text,
                     'url': clean_related_url
                 })
-        except:
-            continue
+                continue
+        except Exception as e:
+            print(f'  newspaper failed for related article {clean_related_url}: {e}')
+
+        # Fallback: use web_fetch
+        try:
+            text = web_fetch_article_text(clean_related_url)
+            if text:
+                related_articles_data.append({
+                    'title': clean_related_url,  # No title available from web_fetch
+                    'text': text,
+                    'url': clean_related_url
+                })
+        except Exception as e:
+            print(f'  web_fetch fallback also failed for related article {clean_related_url}: {e}')
 
     return related_articles_data
 
@@ -463,7 +440,7 @@ Please review the entire newsletter and make the following improvements:
 
 2. **Vary sentence starters**: Look at all the article excerpt sentences and ensure they don't start with repetitive words/phrases. Rewrite excerpts to have more varied and engaging openings while maintaining the same factual content.
 
-3. **Overall polish**: 
+3. **Overall polish**:
    - Ensure consistent formatting
    - Fix any grammatical errors
    - Improve flow and readability
@@ -475,8 +452,8 @@ Please review the entire newsletter and make the following improvements:
 Return the polished markdown content. Keep all the original structure and formatting intact, just improve the quality and remove any issues.
 Just output the polished markdown content, with no additional explanations or comments.
 '''.strip()
-    
-    return query_openai(system_prompt, markdown_content, max_completion_tokens=FINAL_POLISH_MAX_TOKENS, model='gpt-5', debug_label="FINAL_POLISH")
+
+    return query_llm_simple(system_prompt, markdown_content, max_tokens=FINAL_POLISH_MAX_TOKENS, model=MODEL_SONNET, debug_label="FINAL_POLISH")
 
 
 if __name__ == "__main__":
@@ -575,7 +552,7 @@ if __name__ == "__main__":
             'category': category,
             'news_article': news_article
         })
-    
+
     print('Populating content...')
     top_news_parts = []
     content_parts = []
@@ -603,7 +580,7 @@ if __name__ == "__main__":
                     .replace('$digest_excerpt$', digest_excerpt)
 
     print('Applying final polish to the newsletter...')
-    
+
     # Split the markdown into header (YAML front matter) and content
     if md.startswith('---'):
         # Find the end of the YAML front matter
@@ -611,10 +588,10 @@ if __name__ == "__main__":
         if len(parts) >= 3:
             header = f"---{parts[1]}---"
             content_to_polish = parts[2]
-            
+
             # Polish only the content portion
             polished_content = final_polish_newsletter(content_to_polish)
-            
+
             # Recombine header and polished content
             md = header + polished_content
         else:
